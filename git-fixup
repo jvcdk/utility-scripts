@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  git-fixup [<commit>]
+
+If <commit> is omitted:
+  - Inspect staged files
+  - Find the latest commits on HEAD that last touched those files
+  - If exactly one commit is found, create a fixup commit and autosquash rebase
+  - If multiple commits are found, list them (short form) and exit
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+ensure_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "Not a git repository."
+}
+
+resolve_commit() {
+  local ref="$1"
+  git rev-parse --verify "${ref}^{commit}" &>/dev/null || die "Commit '${ref}' not found."
+  git rev-parse --verify "${ref}^{commit}"
+}
+
+staged_files() {
+  # NUL-delimited for safety
+  git diff --cached --name-only -z
+}
+
+commits_for_files() {
+  # Read NUL-delimited file list from stdin; output unique full SHAs (one per line)
+  local -a files=()
+  local -A seen=()
+  local file sha
+  # read -d '' reads until NUL
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done
+  ((${#files[@]} > 0)) || die "No staged files. Stage your changes or pass a commit explicitly."
+
+  # Gather most recent commit (reachable from HEAD) that touched each file
+  for file in "${files[@]}"; do
+    # If file no longer exists in HEAD (e.g., staged add), git log still finds its last change if any
+    if sha=$(git log -n 1 --pretty=%H -- "$file" 2>/dev/null); then
+      if [[ -n "${sha}" && -z "${seen[$sha]:-}" ]]; then
+        seen[$sha]=1
+        echo "$sha"
+      fi
+    fi
+  done
+}
+
+print_commits_short() {
+  local -a shas=("$@")
+  # Print short form (abbrev hash + subject)
+  for sha in "${shas[@]}"; do
+    git show -s --oneline --no-patch "$sha"
+  done
+}
+
+do_fixup_and_rebase() {
+  local target="$1"
+  git commit --fixup="$target"
+  git rebase --interactive --autosquash --autostash "${target}^"
+}
+
+main() {
+  ensure_repo
+
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage; exit 0
+  fi
+
+  if [[ $# -ge 1 ]]; then
+    local target
+    target=$(resolve_commit "$1")
+    do_fixup_and_rebase "$target"
+    exit 0
+  fi
+
+  # No explicit commit: infer from staged files
+  mapfile -t candidate_shas < <(staged_files | commits_for_files | tr -d '\r')
+
+  # If none found (e.g., all files are new and have no history), bail out
+  ((${#candidate_shas[@]} > 0)) || die "Could not infer a target commit from staged files."
+
+  if ((${#candidate_shas[@]} == 1)); then
+    do_fixup_and_rebase "${candidate_shas[0]}"
+    exit 0
+  fi
+
+  echo "Multiple candidate commits found from staged files; please pick one and re-run:" >&2
+  print_commits_short "${candidate_shas[@]}" >&2
+  exit 2
+}
+
+main "$@"

@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""
+webappify - Turn any website into a desktop app with isolated browser profile.
+
+Usage:
+    webappify                  # interactive "add" mode
+    webappify add [URL]        # add a new web app
+    webappify list             # list installed web apps
+    webappify remove [NAME]    # remove a web app
+
+Dependencies:
+    - ImageMagick (v6 or v7) and/or rsvg-convert for icon conversion
+"""
+
+__version__ = "1.0.0"
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Optional
+
+# --- Constants ---
+
+APPS_DIR = Path.home() / ".local" / "share" / "applications"
+ICONS_DIR = APPS_DIR / "icons"
+WEBAPPS_DIR = Path.home() / ".webapp"
+DESKTOP_PREFIX = "webappify-"
+
+
+# --- Browser definitions ---
+
+def _chromium_build_cmd(cmd, url, profile_dir):
+    return [cmd, f"--app={url}", f"--user-data-dir={profile_dir}"]
+
+
+def _chromium_wm_class(prefix: str, url: str) -> str:
+    """Predict the WM_CLASS Chromium assigns to a --app=URL window.
+
+    Chromium ignores both --class= and argv[0] for --app= windows and
+    instead synthesizes the class internally as:
+
+        {prefix}-{host}_{path-with-slashes-as-underscores}-{profile}
+
+    where {prefix} is the browser's program class (e.g. "brave"), and
+    {profile} is "Default" for the default profile inside --user-data-dir.
+    For https://tidal.com/ with Brave this yields "brave-tidal.com__-Default".
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc
+    path = parsed.path or "/"
+    munged_path = path.replace("/", "_")
+    return f"{prefix}-{host}_{munged_path}-Default"
+
+
+BROWSERS = {
+    "chrome": {
+        "name": "Google Chrome",
+        "commands": ["google-chrome-stable", "google-chrome"],
+        "build_cmd": _chromium_build_cmd,
+        "wm_class_prefix": "google-chrome",
+    },
+    "chromium": {
+        "name": "Chromium",
+        "commands": ["chromium-browser", "chromium"],
+        "build_cmd": _chromium_build_cmd,
+        "wm_class_prefix": "chromium-browser",
+    },
+    "brave": {
+        "name": "Brave",
+        "commands": ["brave-browser", "brave"],
+        "build_cmd": _chromium_build_cmd,
+        "wm_class_prefix": "brave",  # confirmed via GNOME Looking Glass
+    },
+    "edge": {
+        "name": "Microsoft Edge",
+        "commands": ["microsoft-edge-stable", "microsoft-edge"],
+        "build_cmd": _chromium_build_cmd,
+        "wm_class_prefix": "microsoft-edge",
+    },
+    "vivaldi": {
+        "name": "Vivaldi",
+        "commands": ["vivaldi-stable", "vivaldi"],
+        "build_cmd": _chromium_build_cmd,
+        "wm_class_prefix": "vivaldi",
+    },
+}
+
+
+# --- Utility functions ---
+
+def _domain(url: str) -> str:
+    return urllib.parse.urlparse(url).netloc
+
+
+def _canonical_name(url: str) -> str:
+    """Turn a URL into a filesystem-safe canonical name."""
+    parsed = urllib.parse.urlparse(url)
+    name = parsed.netloc + parsed.path.rstrip("/")
+    name = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name.lower()
+
+
+def _desktop_filename(canonical: str) -> str:
+    return f"{DESKTOP_PREFIX}{canonical}.desktop"
+
+
+def _quote_exec_arg(arg: str) -> str:
+    """Quote an argument for a .desktop Exec line.
+
+    Desktop entry spec processes % field codes before shell-like parsing,
+    so % must always be escaped to %%, even inside quotes.
+    """
+    # Escape % first (must happen before quoting logic)
+    arg = arg.replace("%", "%%")
+    needs_quoting = any(c in arg for c in ' "$`\\|&;()<>') or not arg
+    if needs_quoting:
+        escaped = arg.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return arg
+
+
+def _build_exec_line(args: list) -> str:
+    """Build a properly quoted Exec= value for a .desktop file."""
+    return " ".join(_quote_exec_arg(a) for a in args)
+
+
+def _find_browser_command(browser_key: str) -> Optional[str]:
+    """Find the actual executable for a browser."""
+    info = BROWSERS[browser_key]
+    for cmd in info["commands"]:
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
+def _find_imagemagick() -> Optional[list]:
+    """Find the ImageMagick convert command (v7 or v6)."""
+    if shutil.which("magick"):
+        return ["magick", "convert"]
+    if shutil.which("convert"):
+        return ["convert"]
+    return None
+
+
+def _fetch(url: str, timeout: int = 15) -> tuple:
+    """Fetch a URL. Returns (body_bytes, final_url_after_any_redirects)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), resp.geturl()
+
+
+def _fetch_text(url: str) -> tuple:
+    """Fetch a URL as text. Returns (decoded_body, final_url)."""
+    data, final_url = _fetch(url)
+    return data.decode("utf-8", errors="replace"), final_url
+
+
+# --- Desktop file parsing ---
+
+def _parse_desktop_file(path: Path) -> dict:
+    """Parse a .desktop file and return its key-value pairs."""
+    props = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k.strip()] = v.strip()
+    return props
+
+
+def _iter_webapps() -> list:
+    """Return list of (canonical_name, desktop_path, props) for installed webapps."""
+    results = []
+    for f in sorted(APPS_DIR.glob(f"{DESKTOP_PREFIX}*.desktop")):
+        props = _parse_desktop_file(f)
+        canonical = props.get(
+            "X-WebAppify-Canonical",
+            f.stem.removeprefix(DESKTOP_PREFIX),
+        )
+        results.append((canonical, f, props))
+    return results
+
+
+# --- HTML title extraction ---
+
+class _TitleParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._in_title = False
+        self.title = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+
+def extract_title(html: str) -> str:
+    parser = _TitleParser()
+    parser.feed(html)
+    return parser.title.strip()
+
+
+# --- Icon discovery ---
+
+class _LinkParser(HTMLParser):
+    """Extract <link> and <meta> tags relevant to icons, plus manifest URL."""
+
+    def __init__(self):
+        super().__init__()
+        self.icons = []
+        self.manifest_url = None
+
+    def handle_starttag(self, tag, attrs):
+        attr = dict(attrs)
+        if tag.lower() == "link":
+            rel = (attr.get("rel") or "").lower()
+            href = attr.get("href")
+            if not href:
+                return
+            if "apple-touch-icon" in rel:
+                sizes = _parse_size(attr.get("sizes", "180x180"))
+                self.icons.append({"url": href, "size": sizes, "priority": 1})
+            elif "icon" in rel:
+                sizes = _parse_size(attr.get("sizes", "0x0"))
+                self.icons.append({"url": href, "size": sizes, "priority": 3})
+            elif rel == "manifest":
+                self.manifest_url = href
+        elif tag.lower() == "meta":
+            # The OpenGraph spec says `property=`, but many sites use `name=`
+            # (including big ones). Twitter cards always use `name=`.
+            key = (attr.get("property") or attr.get("name") or "").lower()
+            content = attr.get("content")
+            if not content:
+                return
+            if key in ("og:image", "twitter:image", "twitter:image:src"):
+                self.icons.append({
+                    "url": content,
+                    "size": (256, 256),
+                    "priority": 5,
+                })
+            elif key == "msapplication-tileimage":
+                # MS tile images are explicitly designed as icons: square,
+                # usually high-res. Rank them above og:image.
+                self.icons.append({
+                    "url": content,
+                    "size": (144, 144),
+                    "priority": 4,
+                })
+
+
+def _parse_size(s: str) -> tuple:
+    m = re.match(r"(\d+)x(\d+)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return (0, 0)
+
+
+def discover_icons(html: str, base_url: str) -> list:
+    """Discover icons from HTML, returning sorted list (best first)."""
+    parser = _LinkParser()
+    parser.feed(html)
+
+    # Try manifest for high-res icons
+    if parser.manifest_url:
+        manifest_url = urllib.parse.urljoin(base_url, parser.manifest_url)
+        try:
+            manifest_body, _ = _fetch_text(manifest_url)
+            manifest = json.loads(manifest_body)
+            for icon in manifest.get("icons", []):
+                src = icon.get("src")
+                if src:
+                    sizes = _parse_size(icon.get("sizes", "0x0"))
+                    parser.icons.append({
+                        "url": urllib.parse.urljoin(manifest_url, src),
+                        "size": sizes,
+                        "priority": 0,
+                    })
+        except Exception:
+            pass
+
+    # Resolve relative URLs
+    for icon in parser.icons:
+        icon["url"] = urllib.parse.urljoin(base_url, icon["url"])
+
+    # Fallback: /favicon.ico
+    parsed = urllib.parse.urlparse(base_url)
+    favicon_url = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+    parser.icons.append({"url": favicon_url, "size": (16, 16), "priority": 10})
+
+    # Sort: lowest priority number first, then largest size
+    parser.icons.sort(key=lambda i: (i["priority"], -(i["size"][0] * i["size"][1])))
+
+    return parser.icons
+
+
+def download_icon(icons: list, dest_path: Path) -> bool:
+    """Try downloading icons in order. Convert to PNG. Return True on success."""
+    for icon in icons:
+        url = icon["url"]
+        try:
+            data, _ = _fetch(url, timeout=10)
+            if len(data) < 100:
+                continue
+            if _save_icon(data, url, dest_path):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _save_icon(data: bytes, source_url: str, dest_path: Path) -> bool:
+    """Save icon data as PNG, converting if needed. Returns True on success."""
+    dest_path = dest_path.with_suffix(".png")
+
+    # SVG: try rsvg-convert first, then cairosvg
+    if b"<svg" in data[:500].lower() or source_url.lower().endswith(".svg"):
+        return _convert_svg(data, dest_path)
+
+    # Convert to PNG using ImageMagick
+    magick_cmd = _find_imagemagick()
+    if not magick_cmd:
+        return False
+
+    tmp = dest_path.with_suffix(".tmp")
+    try:
+        tmp.write_bytes(data)
+        subprocess.run(
+            [*magick_cmd, str(tmp), "-resize", "128x128<", str(dest_path)],
+            check=True, capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _convert_svg(data: bytes, dest_path: Path) -> bool:
+    """Convert SVG bytes to PNG. Tries rsvg-convert first, then cairosvg."""
+    # Prefer rsvg-convert when installed. It needs the SVG on disk, so we
+    # only write the temp file when we're actually going to use the tool.
+    if shutil.which("rsvg-convert"):
+        tmp = dest_path.with_suffix(".svg")
+        try:
+            tmp.write_bytes(data)
+            subprocess.run(
+                ["rsvg-convert", "-w", "256", "-h", "256",
+                 "-o", str(dest_path), str(tmp)],
+                check=True, capture_output=True,
+            )
+            return True
+        except subprocess.CalledProcessError:
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    # Fall back to cairosvg, which reads from bytes directly — no tmp file.
+    try:
+        import cairosvg
+        cairosvg.svg2png(
+            bytestring=data, write_to=str(dest_path),
+            output_width=256, output_height=256,
+        )
+        return True
+    except ImportError:
+        return False
+
+
+# --- User interaction ---
+
+def prompt(msg: str, default: str = "") -> str:
+    if default:
+        result = input(f"{msg} [{default}]: ").strip()
+        return result or default
+    return input(f"{msg}: ").strip()
+
+
+def choose(msg: str, options: list, default: int = 0) -> int:
+    print(msg)
+    for i, opt in enumerate(options):
+        marker = " *" if i == default else ""
+        print(f"  {i + 1}) {opt}{marker}")
+    while True:
+        raw = input(f"Choice [default {default + 1}]: ").strip()
+        if not raw:
+            return default
+        try:
+            n = int(raw) - 1
+            if 0 <= n < len(options):
+                return n
+        except ValueError:
+            pass
+        print("Invalid choice, try again.")
+
+
+# --- Core commands ---
+
+def cmd_add(url: Optional[str]):
+    # 1. Get URL
+    if not url:
+        url = prompt("URL to appify")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    # 2. Fetch HTML. We do this before computing the canonical name so we
+    # can adopt the post-redirect URL: e.g. `example.com` -> `www.example.com`
+    # means the launcher should point at (and be named after) the latter.
+    print(f"Fetching {url} ...")
+    try:
+        html, final_url = _fetch_text(url)
+    except urllib.error.HTTPError as e:
+        # Some sites (e.g. bot protection like DataDome/Cloudflare) return 4xx
+        # with a usable HTML body that still has <title> and a favicon link.
+        # Keep the body and continue; the user can edit the title at the prompt.
+        print(f"  Warning: server returned HTTP {e.code}, using response body anyway")
+        try:
+            html = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            html = ""
+        final_url = url
+    except Exception as e:
+        print(f"Error: Could not fetch URL: {e}")
+        sys.exit(1)
+    print("OK")
+
+    if final_url != url:
+        print(f"  Followed redirect: {url} -> {final_url}")
+        url = final_url
+
+    canonical = _canonical_name(url)
+
+    # 3. Check for duplicates (after redirect resolution, so that two inputs
+    # that resolve to the same canonical URL are correctly deduplicated).
+    desktop_file = APPS_DIR / _desktop_filename(canonical)
+    if desktop_file.exists():
+        print(f"Error: '{canonical}' is already appified.")
+        print(f"  Desktop file: {desktop_file}")
+        print("  Use 'webappify remove' first if you want to recreate it.")
+        sys.exit(1)
+
+    # 4. Extract & edit title
+    title = extract_title(html) or _domain(url)
+    title = prompt("App name", title)
+
+    # 5. Choose browser
+    available = []
+    not_installed = []
+    for key, info in BROWSERS.items():
+        cmd = _find_browser_command(key)
+        if cmd:
+            available.append((key, cmd, info["name"]))
+        else:
+            not_installed.append(info["name"])
+
+    if not available:
+        print("Error: No supported browser found on your system.")
+        print("Install one of the following:")
+        for name in not_installed:
+            print(f"  - {name}")
+        sys.exit(1)
+
+    if not_installed:
+        print("\n  Other supported browsers you could install:")
+        for name in not_installed:
+            print(f"    - {name}")
+        print()
+
+    browser_idx = choose(
+        "Which browser to use?",
+        [f"{name} ({cmd})" for _, cmd, name in available],
+        default=0,
+    )
+    browser_key, browser_cmd, browser_name = available[browser_idx]
+
+    # 6. Discover & download icon
+    ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    icon_path = ICONS_DIR / f"{canonical}.png"
+
+    print("Looking for icons...")
+    icons = discover_icons(html, url)
+    real_icons = [i for i in icons if i["priority"] < 10]
+    if real_icons:
+        best = real_icons[0]
+        print(f"  Found {len(real_icons)} icon(s), best: "
+              f"{best['size'][0]}x{best['size'][1]} "
+              f"(from {best['url'][:80]})")
+
+    success = download_icon(icons, icon_path)
+
+    if not success:
+        print("Could not find or download a usable icon.")
+        while True:
+            custom = prompt(
+                "Provide icon path (/...) or URL (https://...), "
+                "or 'skip' to use default"
+            )
+            if custom.lower() == "skip":
+                icon_path = None
+                break
+            if custom.startswith(("http://", "https://")):
+                try:
+                    data, _ = _fetch(custom)
+                    if _save_icon(data, custom, icon_path):
+                        success = True
+                        break
+                except Exception as e:
+                    print(f"  Failed to fetch: {e}")
+            elif os.path.isfile(custom):
+                try:
+                    data = Path(custom).read_bytes()
+                    if _save_icon(data, custom, icon_path):
+                        success = True
+                        break
+                except Exception as e:
+                    print(f"  Failed to read/convert: {e}")
+            else:
+                print("  Not a valid file or URL.")
+
+    if success and icon_path and icon_path.exists():
+        icon_value = str(icon_path)
+    else:
+        icon_value = "application-x-executable"
+
+    # 7. Create profile directory (0o700: browser needs write access, data is private)
+    profile_dir = WEBAPPS_DIR / canonical
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir.chmod(0o700)
+
+    # 8. Build Exec line and predict WM_CLASS. Chromium synthesizes the
+    # WM_CLASS of --app= windows internally from the URL and profile, and
+    # ignores both --class= and argv[0], so the only way to get GNOME Shell
+    # to associate the window with this .desktop file is to predict that
+    # class and match it in StartupWMClass.
+    browser_info = BROWSERS[browser_key]
+    exec_args = browser_info["build_cmd"](browser_cmd, url, str(profile_dir))
+    exec_line = _build_exec_line(exec_args)
+    wm_class = _chromium_wm_class(browser_info["wm_class_prefix"], url)
+
+    # 9. Write .desktop file
+    APPS_DIR.mkdir(parents=True, exist_ok=True)
+    desktop_content = textwrap.dedent(f"""\
+        [Desktop Entry]
+        Name={title}
+        Exec={exec_line}
+        Icon={icon_value}
+        Type=Application
+        Categories=Network;
+        StartupWMClass={wm_class}
+        X-WebAppify-URL={url}
+        X-WebAppify-Browser={browser_key}
+        X-WebAppify-Canonical={canonical}
+        X-WebAppify-ProfileDir={profile_dir}
+    """)
+
+    desktop_file.write_text(desktop_content)
+    os.chmod(desktop_file, 0o755)
+
+    # Update desktop database
+    try:
+        subprocess.run(
+            ["update-desktop-database", str(APPS_DIR)],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
+
+    print()
+    print(f"✓ Created web app '{title}'")
+    print(f"  Desktop file : {desktop_file}")
+    print(f"  Profile dir  : {profile_dir}")
+    print(f"  Icon         : {icon_value}")
+    print(f"  Browser      : {browser_name}")
+    print(f"  WM Class     : {wm_class}")
+    print()
+    print("It should now appear in your application launcher.")
+
+
+def cmd_list():
+    webapps = _iter_webapps()
+    if not webapps:
+        print("No web apps installed.")
+        return
+
+    for canonical, path, props in webapps:
+        print(f"  {props.get('Name', '?')}")
+        print(f"    URL     : {props.get('X-WebAppify-URL', '?')}")
+        print(f"    Browser : {props.get('X-WebAppify-Browser', '?')}")
+        print(f"    ID      : {canonical}")
+        print()
+
+
+def cmd_remove(name: Optional[str]):
+    webapps = _iter_webapps()
+    if not webapps:
+        print("No web apps installed.")
+        return
+
+    apps = {canonical: (path, props) for canonical, path, props in webapps}
+
+    # If no name given, let user pick
+    if not name:
+        keys = list(apps.keys())
+        labels = [f"{apps[k][1].get('Name', k)} ({k})" for k in keys]
+        idx = choose("Which app to remove?", labels)
+        name = keys[idx]
+
+    if name not in apps:
+        print(f"Error: No web app with ID '{name}'.")
+        print("Use 'webappify list' to see installed apps.")
+        sys.exit(1)
+
+    desktop_path, props = apps[name]
+    app_name = props.get("Name", name)
+
+    confirm = input(f"Remove '{app_name}' and all its data? [y/N]: ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("Cancelled.")
+        return
+
+    # Remove desktop file
+    desktop_path.unlink(missing_ok=True)
+    print(f"  Removed {desktop_path}")
+
+    # Remove icon (_save_icon always writes .png)
+    icon = ICONS_DIR / f"{name}.png"
+    if icon.exists():
+        icon.unlink()
+        print(f"  Removed {icon}")
+
+    # Remove profile directory
+    profile_dir = props.get("X-WebAppify-ProfileDir")
+    profile = Path(profile_dir) if profile_dir else WEBAPPS_DIR / name
+    if profile.exists():
+        shutil.rmtree(profile)
+        print(f"  Removed {profile}")
+
+    # Update desktop database
+    try:
+        subprocess.run(
+            ["update-desktop-database", str(APPS_DIR)],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
+
+    print(f"✓ Removed '{app_name}'")
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="webappify",
+        description="Turn any website into a desktop app with an isolated browser profile.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    add_p = sub.add_parser("add", help="Add a new web app")
+    add_p.add_argument("url", nargs="?", help="URL to appify")
+
+    sub.add_parser("list", help="List installed web apps")
+
+    rm_p = sub.add_parser("remove", help="Remove a web app")
+    rm_p.add_argument("name", nargs="?", help="Canonical name of the app to remove")
+
+    args = parser.parse_args()
+
+    if args.command is None or args.command == "add":
+        cmd_add(getattr(args, "url", None))
+    elif args.command == "list":
+        cmd_list()
+    elif args.command == "remove":
+        cmd_remove(getattr(args, "name", None))
+
+
+if __name__ == "__main__":
+    main()

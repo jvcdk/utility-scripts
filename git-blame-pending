@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+Report, for each *unstaged* single-line edit, which commit last touched that line.
+
+Assumptions:
+- Only single-line edits (no net line adds/removes across the file).
+- No staged changes (index == HEAD).
+"""
+
+import subprocess
+import sys
+import re
+from collections import defaultdict
+from typing import Dict, List, Tuple, Set
+
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+ChangedLine = Tuple[str, int]  # (path, old_line_number)
+
+
+def run_git(args: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git"] + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def ensure_git_repo() -> None:
+    p = run_git(["rev-parse", "--show-toplevel"])
+    if p.returncode != 0:
+        print("Error: not inside a git repository.", file=sys.stderr)
+        sys.exit(1)
+
+
+def has_staged_changes() -> bool:
+    p = run_git(["diff", "--cached", "--quiet"])
+    # git diff --cached --quiet exits with 1 if there *are* staged changes
+    if p.returncode not in (0, 1):
+        print("Error: failed to check staged changes.", file=sys.stderr)
+        sys.exit(1)
+    return p.returncode == 1
+
+
+def collect_changed_lines(used_cached: bool) -> Set[ChangedLine]:
+    """
+    Parse `git diff` (unstaged vs index) with --unified=0 and return
+    the original line numbers in HEAD/index for changed lines.
+    """
+    git_args = ["diff", "--unified=0", "--no-color"]
+    if used_cached:
+        print("Info: Using staged diff:")
+        git_args.append("--cached")
+    else:
+        print("Info: Using unstaged diff:")
+    p = run_git(git_args)
+    if p.returncode != 0:
+        print("Error: git diff failed:", file=sys.stderr)
+        print(p.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    changed_lines: Set[ChangedLine] = set()
+    current_file: str | None = None
+
+    old_start = None
+    # line offset within the old side of the hunk
+    old_offset = None
+
+    for raw_line in p.stdout.splitlines():
+        line = raw_line.rstrip("\n")
+
+        if line.startswith("diff --git "):
+            current_file = None
+            continue
+
+        if line.startswith("+++ "):
+            # format: +++ b/path or +++ /dev/null
+            if line.startswith("+++ b/"):
+                current_file = line[6:]  # skip "+++ b/"
+            else:
+                current_file = None
+            continue
+
+        # Hunk header
+        if line.startswith("@@"):
+            m = HUNK_RE.match(line)
+            if not m:
+                continue
+            old_start = int(m.group(1))
+            old_offset = 0
+            continue
+
+        # We only care about hunks inside a valid file
+        if current_file is None or old_start is None or old_offset is None:
+            continue
+
+        if not line:
+            continue
+
+        prefix = line[0]
+
+        if prefix == " ":
+            # context line: advances old line counter
+            old_offset += 1
+        elif prefix == "-":
+            # removed line on old side -> changed line
+            line_no = old_start + old_offset
+            changed_lines.add((current_file, line_no))
+            old_offset += 1
+        elif prefix == "+":
+            # added line on new side: does not advance old line counter
+            # (since old side didn't have this line)
+            pass
+        else:
+            # Unexpected; ignore
+            continue
+
+    return changed_lines
+
+
+def blame_line(path: str, line_no: int) -> Dict[str, str]:
+    """
+    Run git blame for a single line in HEAD and return metadata.
+    """
+    p = run_git(["blame", "HEAD", "--porcelain", f"-L{line_no},{line_no}", "--", path])
+    if p.returncode != 0:
+        return {
+            "sha": "UNKNOWN",
+            "author": "UNKNOWN",
+            "author_time": "",
+            "summary": f"(failed to blame line {line_no})",
+        }
+
+    sha = "UNKNOWN"
+    author = "UNKNOWN"
+    author_time = ""
+    summary = ""
+
+    first = True
+    for raw in p.stdout.splitlines():
+        line = raw.rstrip("\n")
+        if first:
+            # first line: "<sha> <orig_lineno> <final_lineno> <num_lines>"
+            parts = line.split()
+            if parts:
+                sha = parts[0]
+            first = False
+            continue
+
+        if line.startswith("author "):
+            author = line[len("author ") :]
+        elif line.startswith("author-time "):
+            author_time = line[len("author-time ") :]
+        elif line.startswith("summary "):
+            summary = line[len("summary ") :]
+            # we can break after summary; rest isn't needed
+            break
+
+    return {
+        "sha": sha,
+        "author": author,
+        "author_time": author_time,
+        "summary": summary,
+    }
+
+
+def main() -> None:
+    ensure_git_repo()
+
+    changed = collect_changed_lines(has_staged_changes())
+    if not changed:
+        print("No unstaged line edits detected.")
+        return
+
+    # Group by file for nicer output
+    by_file: Dict[str, List[int]] = defaultdict(list)
+    for path, line_no in sorted(changed, key=lambda t: (t[0], t[1])):
+        by_file[path].append(line_no)
+
+    for path in sorted(by_file.keys()):
+        print(f"{path}:")
+        for line_no in by_file[path]:
+            info = blame_line(path, line_no)
+            sha = info["sha"]
+            author = info["author"]
+            summary = info["summary"]
+            print(f"  line {line_no:5d}: {sha} {author} - {summary}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
